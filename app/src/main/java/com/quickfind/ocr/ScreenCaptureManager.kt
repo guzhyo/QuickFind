@@ -10,6 +10,7 @@ import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.DisplayMetrics
@@ -63,13 +64,30 @@ class ScreenCaptureManager(private val context: Context) {
 
         // 获取屏幕参数
         val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        val metrics = DisplayMetrics()
-        @Suppress("DEPRECATION")
-        windowManager.defaultDisplay.realMetrics(metrics)
+        val screenWidth: Int
+        val screenHeight: Int
+        val screenDensity: Int
 
-        val screenWidth = metrics.widthPixels
-        val screenHeight = metrics.heightPixels
-        val screenDensity = metrics.densityDpi
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val windowMetrics = windowManager.currentWindowMetrics
+            val bounds = windowMetrics.bounds
+            screenWidth = bounds.width()
+            screenHeight = bounds.height()
+            val config = context.resources.configuration
+            screenDensity = when (config.densityDpi) {
+                in 0..119 -> DisplayMetrics.DENSITY_LOW
+                in 120..159 -> DisplayMetrics.DENSITY_MEDIUM
+                in 160..239 -> DisplayMetrics.DENSITY_HIGH
+                else -> DisplayMetrics.DENSITY_XXHIGH
+            }
+        } else {
+            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.getRealMetrics(metrics)
+            screenWidth = metrics.widthPixels
+            screenHeight = metrics.heightPixels
+            screenDensity = metrics.densityDpi
+        }
 
         // 创建后台线程处理图像
         handlerThread = HandlerThread("ScreenCapture").also { it.start() }
