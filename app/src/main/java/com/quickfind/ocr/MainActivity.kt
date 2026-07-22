@@ -1,10 +1,13 @@
 package com.quickfind.ocr
 
 import android.app.Activity
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -38,7 +41,29 @@ class MainActivity : ComponentActivity() {
     private lateinit var ocrEngine: OcrEngine
     private lateinit var captureManager: ScreenCaptureManager
 
-    // 用 Activity 级别的回调，避免 DisposableEffect
+    // 接收前台服务的截图结果
+    private val captureReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                "com.quickfind.ocr.SCREEN_CAPTURE_RESULT" -> {
+                    val bitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra("bitmap", Bitmap::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra("bitmap")
+                    }
+                    if (bitmap != null) {
+                        onBitmapCaptured?.invoke(bitmap)
+                    }
+                }
+                "com.quickfind.ocr.SCREEN_CAPTURE_ERROR" -> {
+                    val error = intent.getStringExtra("error") ?: "未知错误"
+                    Toast.makeText(this@MainActivity, "截图失败: $error", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
     var onBitmapCaptured: ((Bitmap) -> Unit)? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -51,6 +76,17 @@ class MainActivity : ComponentActivity() {
             Toast.makeText(this, "初始化失败: ${e.message}", Toast.LENGTH_LONG).show()
             finish()
             return
+        }
+
+        // 注册广播接收器
+        val filter = IntentFilter().apply {
+            addAction("com.quickfind.ocr.SCREEN_CAPTURE_RESULT")
+            addAction("com.quickfind.ocr.SCREEN_CAPTURE_ERROR")
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(captureReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(captureReceiver, filter)
         }
 
         setContent {
@@ -66,16 +102,12 @@ class MainActivity : ComponentActivity() {
         if (requestCode == ScreenCaptureManager.REQUEST_CODE_SCREEN_CAPTURE) {
             if (resultCode == Activity.RESULT_OK && data != null) {
                 try {
-                    captureManager.startCapture(resultCode, data) { bitmap ->
-                        runOnUiThread {
-                            if (bitmap != null) {
-                                onBitmapCaptured?.invoke(bitmap)
-                            }
-                        }
-                    }
+                    captureManager.startCapture(resultCode, data)
                 } catch (e: Exception) {
                     Toast.makeText(this, "截图失败: ${e.message}", Toast.LENGTH_SHORT).show()
                 }
+            } else {
+                Toast.makeText(this, "截图权限被拒绝", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -83,8 +115,10 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         try {
+            unregisterReceiver(captureReceiver)
+        } catch (_: Exception) {}
+        try {
             ocrEngine.close()
-            captureManager.release()
         } catch (_: Exception) {}
     }
 
