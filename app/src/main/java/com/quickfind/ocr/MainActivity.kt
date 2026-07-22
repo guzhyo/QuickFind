@@ -72,6 +72,7 @@ class MainActivity : AppCompatActivity() {
         try {
             ocrEngine = OcrEngine()
             captureManager = ScreenCaptureManager(this)
+            captureManager.onError = { msg -> showStatus(msg) }
         } catch (e: Exception) {
             showStatus("初始化失败: ${e.message}")
         }
@@ -111,8 +112,29 @@ class MainActivity : AppCompatActivity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_NOTIFICATION) {
-            // 无论是否授权都尝试截图
-            startScreenCapture()
+            val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+            if (granted) {
+                startScreenCapture()
+            } else {
+                // 通知权限被拒绝，但截图功能在 Android 14+ 必须有通知权限
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    showStatus("截图功能需要通知权限（用于显示截图提示），请在设置中开启")
+                    // 尝试引导用户到设置页面
+                    android.app.AlertDialog.Builder(this)
+                        .setTitle("需要通知权限")
+                        .setMessage("屏幕截图功能需要通知权限来运行后台服务。\n\n请前往设置 → 应用 → 快速查找 → 通知 → 允许通知")
+                        .setPositiveButton("去设置") { _, _ ->
+                            val intent = android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                                data = android.net.Uri.fromParts("package", packageName, null)
+                            }
+                            startActivity(intent)
+                        }
+                        .setNegativeButton("取消", null)
+                        .show()
+                } else {
+                    startScreenCapture()
+                }
+            }
         }
     }
 

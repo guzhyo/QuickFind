@@ -15,6 +15,8 @@ class ScreenCaptureManager(private val context: Context) {
         const val REQUEST_CODE_SCREEN_CAPTURE = 1001
     }
 
+    var onError: ((String) -> Unit)? = null
+
     /**
      * 发起屏幕截图权限请求
      */
@@ -32,17 +34,13 @@ class ScreenCaptureManager(private val context: Context) {
     fun startCapture(resultCode: Int, data: Intent?) {
         if (resultCode != Activity.RESULT_OK || data == null) return
 
-        val serviceIntent = ScreenCaptureService.createIntent(context, resultCode, data)
-        context.startForegroundService(serviceIntent)
-    }
-
-    /**
-     * 停止截图服务
-     */
-    fun stopCapture() {
-        val stopIntent = Intent(context, ScreenCaptureService::class.java).apply {
-            action = ScreenCaptureService.ACTION_STOP
+        try {
+            val serviceIntent = ScreenCaptureService.createIntent(context, resultCode, data)
+            context.startForegroundService(serviceIntent)
+        } catch (e: SecurityException) {
+            onError?.invoke("需要通知权限才能截图，请在设置中开启")
+        } catch (e: Exception) {
+            onError?.invoke("启动截图服务失败: ${e.message}")
         }
-        context.startService(stopIntent)
     }
 }
