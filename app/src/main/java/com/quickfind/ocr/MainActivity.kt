@@ -1,19 +1,14 @@
 package com.quickfind.ocr
 
-import android.Manifest
 import android.app.Activity
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.view.View
 import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
 
 class MainActivity : AppCompatActivity() {
@@ -41,7 +36,6 @@ class MainActivity : AppCompatActivity() {
     companion object {
         // 静态字段传递 Bitmap，避免 Intent 大小限制
         var capturedBitmap: Bitmap? = null
-        const val REQUEST_NOTIFICATION = 2001
     }
 
     // 文件选择器
@@ -87,53 +81,10 @@ class MainActivity : AppCompatActivity() {
         }
 
         btnCapture.setOnClickListener {
-            requestNotificationPermissionAndCapture()
-        }
-    }
-
-    // 请求通知权限后再截图（Android 13+ 需要）
-    private fun requestNotificationPermissionAndCapture() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(
-                    this,
-                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
-                    REQUEST_NOTIFICATION
-                )
-                return
-            }
-        }
-        startScreenCapture()
-    }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQUEST_NOTIFICATION) {
-            val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
-            if (granted) {
-                startScreenCapture()
-            } else {
-                // 通知权限被拒绝，但截图功能在 Android 14+ 必须有通知权限
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                    showStatus("截图功能需要通知权限（用于显示截图提示），请在设置中开启")
-                    // 尝试引导用户到设置页面
-                    android.app.AlertDialog.Builder(this)
-                        .setTitle("需要通知权限")
-                        .setMessage("屏幕截图功能需要通知权限来运行后台服务。\n\n请前往设置 → 应用 → 快速查找 → 通知 → 允许通知")
-                        .setPositiveButton("去设置") { _, _ ->
-                            val intent = android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                                data = android.net.Uri.fromParts("package", packageName, null)
-                            }
-                            startActivity(intent)
-                        }
-                        .setNegativeButton("取消", null)
-                        .show()
-                } else {
-                    startScreenCapture()
-                }
+            try {
+                captureManager.requestScreenCapture(this)
+            } catch (e: Exception) {
+                showStatus("截图请求失败: ${e.message}")
             }
         }
     }

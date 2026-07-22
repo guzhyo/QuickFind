@@ -7,7 +7,6 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.ImageFormat
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -32,7 +31,6 @@ class ScreenCaptureService : Service() {
         const val NOTIFICATION_ID = 1001
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
-        const val ACTION_STOP = "com.quickfind.ocr.STOP_CAPTURE"
 
         fun createIntent(context: Context, resultCode: Int, data: Intent): Intent {
             return Intent(context, ScreenCaptureService::class.java).apply {
@@ -53,18 +51,11 @@ class ScreenCaptureService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent == null) {
             stopSelf()
-            return START_NOT_STICKY
-        }
-
-        // 检查是否是停止命令
-        if (intent.action == ACTION_STOP) {
-            cleanup()
             return START_NOT_STICKY
         }
 
@@ -81,9 +72,19 @@ class ScreenCaptureService : Service() {
             return START_NOT_STICKY
         }
 
-        // 启动前台服务
-        val notification = buildNotification()
-        startForeground(NOTIFICATION_ID, notification)
+        // 尝试启动前台服务（如果通知权限不可用则降级）
+        try {
+            createNotificationChannel()
+            val notification = buildNotification()
+            startForeground(NOTIFICATION_ID, notification)
+        } catch (e: SecurityException) {
+            // 通知权限不可用，尝试普通启动
+            try {
+                val notification = buildNotification()
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.notify(NOTIFICATION_ID, notification)
+            } catch (_: Exception) {}
+        } catch (_: Exception) {}
 
         // 开始截图
         startCapture(resultCode, data)
@@ -92,72 +93,75 @@ class ScreenCaptureService : Service() {
     }
 
     private fun startCapture(resultCode: Int, data: Intent) {
-        val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        mediaProjection = projectionManager.getMediaProjection(resultCode, data)
+        try {
+            val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            mediaProjection = projectionManager.getMediaProjection(resultCode, data)
 
-        // 获取屏幕参数
-        val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        val screenWidth: Int
-        val screenHeight: Int
-        val screenDensity: Int
+            // 获取屏幕参数
+            val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            val screenWidth: Int
+            val screenHeight: Int
+            val screenDensity: Int
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val windowMetrics = windowManager.currentWindowMetrics
-            val bounds = windowMetrics.bounds
-            screenWidth = bounds.width()
-            screenHeight = bounds.height()
-            val config = resources.configuration
-            screenDensity = config.densityDpi
-        } else {
-            val metrics = DisplayMetrics()
-            @Suppress("DEPRECATION")
-            windowManager.defaultDisplay.getRealMetrics(metrics)
-            screenWidth = metrics.widthPixels
-            screenHeight = metrics.heightPixels
-            screenDensity = metrics.densityDpi
-        }
-
-        // 创建后台线程
-        handlerThread = HandlerThread("ScreenCapture").also { it.start() }
-        handler = Handler(handlerThread!!.looper)
-
-        // 创建 ImageReader
-        imageReader = ImageReader.newInstance(
-            screenWidth, screenHeight,
-            PixelFormat.RGBA_8888, 2
-        )
-
-        imageReader!!.setOnImageAvailableListener({ reader ->
-            if (hasCaptured) return@setOnImageAvailableListener
-
-            val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-
-            try {
-                hasCaptured = true
-                val bitmap = imageToBitmap(image)
-
-                // 使用静态字段传递 Bitmap，避免 Intent 大小限制和广播复杂性
-                MainActivity.capturedBitmap = bitmap
-
-                // 延迟停止服务
-                handler?.postDelayed({
-                    cleanup()
-                }, 500)
-            } catch (e: Exception) {
-                cleanup()
-            } finally {
-                image.close()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val windowMetrics = windowManager.currentWindowMetrics
+                val bounds = windowMetrics.bounds
+                screenWidth = bounds.width()
+                screenHeight = bounds.height()
+                screenDensity = resources.configuration.densityDpi
+            } else {
+                val metrics = DisplayMetrics()
+                @Suppress("DEPRECATION")
+                windowManager.defaultDisplay.getRealMetrics(metrics)
+                screenWidth = metrics.widthPixels
+                screenHeight = metrics.heightPixels
+                screenDensity = metrics.densityDpi
             }
-        }, handler)
 
-        // 创建虚拟显示器
-        virtualDisplay = mediaProjection!!.createVirtualDisplay(
-            "ScreenCapture",
-            screenWidth, screenHeight, screenDensity,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader!!.surface,
-            null, handler
-        )
+            // 创建后台线程
+            handlerThread = HandlerThread("ScreenCapture").also { it.start() }
+            handler = Handler(handlerThread!!.looper)
+
+            // 创建 ImageReader
+            imageReader = ImageReader.newInstance(
+                screenWidth, screenHeight,
+                PixelFormat.RGBA_8888, 2
+            )
+
+            imageReader!!.setOnImageAvailableListener({ reader ->
+                if (hasCaptured) return@setOnImageAvailableListener
+
+                val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+
+                try {
+                    hasCaptured = true
+                    val bitmap = imageToBitmap(image)
+
+                    // 使用静态字段传递 Bitmap
+                    MainActivity.capturedBitmap = bitmap
+
+                    // 延迟停止服务
+                    handler?.postDelayed({
+                        cleanup()
+                    }, 500)
+                } catch (e: Exception) {
+                    cleanup()
+                } finally {
+                    image.close()
+                }
+            }, handler)
+
+            // 创建虚拟显示器
+            virtualDisplay = mediaProjection!!.createVirtualDisplay(
+                "ScreenCapture",
+                screenWidth, screenHeight, screenDensity,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                imageReader!!.surface,
+                null, handler
+            )
+        } catch (e: Exception) {
+            cleanup()
+        }
     }
 
     private fun imageToBitmap(image: android.media.Image): Bitmap {
@@ -184,20 +188,25 @@ class ScreenCaptureService : Service() {
     }
 
     private fun cleanup() {
-        virtualDisplay?.release()
+        try { virtualDisplay?.release() } catch (_: Exception) {}
         virtualDisplay = null
 
-        imageReader?.close()
+        try { imageReader?.close() } catch (_: Exception) {}
         imageReader = null
 
-        handlerThread?.quitSafely()
+        try { handlerThread?.quitSafely() } catch (_: Exception) {}
         handlerThread = null
 
-        mediaProjection?.stop()
+        try { mediaProjection?.stop() } catch (_: Exception) {}
         mediaProjection = null
 
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } catch (_: Exception) {
+            @Suppress("DEPRECATION")
+            try { stopForeground(true) } catch (_: Exception) {}
+        }
+        try { stopSelf() } catch (_: Exception) {}
     }
 
     private fun createNotificationChannel() {
