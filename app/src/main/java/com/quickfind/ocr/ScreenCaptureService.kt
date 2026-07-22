@@ -18,26 +18,15 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.util.DisplayMetrics
+import android.util.Log
 import android.view.WindowManager
 
-/**
- * 前台服务：处理 MediaProjection 屏幕截图
- * Android 14+ 要求 MediaProjection 必须在前台服务中运行
- */
 class ScreenCaptureService : Service() {
 
     companion object {
         const val CHANNEL_ID = "screen_capture_channel"
         const val NOTIFICATION_ID = 1001
-        const val EXTRA_RESULT_CODE = "result_code"
-        const val EXTRA_RESULT_DATA = "result_data"
-
-        fun createIntent(context: Context, resultCode: Int, data: Intent): Intent {
-            return Intent(context, ScreenCaptureService::class.java).apply {
-                putExtra(EXTRA_RESULT_CODE, resultCode)
-                putExtra(EXTRA_RESULT_DATA, data)
-            }
-        }
+        private const val TAG = "ScreenCaptureService"
     }
 
     private var mediaProjection: MediaProjection? = null
@@ -49,42 +38,34 @@ class ScreenCaptureService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    override fun onCreate() {
-        super.onCreate()
-    }
-
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent == null) {
-            stopSelf()
-            return START_NOT_STICKY
-        }
-
-        val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, -1)
-        val data = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
-        } else {
-            @Suppress("DEPRECATION")
-            intent.getParcelableExtra(EXTRA_RESULT_DATA)
-        }
+        // 从静态字段获取数据
+        val resultCode = MainActivity.pendingResultCode
+        val data = MainActivity.pendingResultData
 
         if (resultCode == -1 || data == null) {
+            Log.e(TAG, "No pending capture data")
             stopSelf()
             return START_NOT_STICKY
         }
 
-        // 尝试启动前台服务（如果通知权限不可用则降级）
+        // 清理静态字段
+        MainActivity.pendingResultCode = -1
+        MainActivity.pendingResultData = null
+
+        // 尝试启动前台服务
         try {
             createNotificationChannel()
             val notification = buildNotification()
             startForeground(NOTIFICATION_ID, notification)
-        } catch (e: SecurityException) {
-            // 通知权限不可用，尝试普通启动
+        } catch (e: Exception) {
+            Log.w(TAG, "startForeground failed: ${e.message}")
+            // 降级：尝试普通通知
             try {
-                val notification = buildNotification()
                 val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                nm.notify(NOTIFICATION_ID, notification)
+                nm.notify(NOTIFICATION_ID, buildNotification())
             } catch (_: Exception) {}
-        } catch (_: Exception) {}
+        }
 
         // 开始截图
         startCapture(resultCode, data)
@@ -97,7 +78,12 @@ class ScreenCaptureService : Service() {
             val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             mediaProjection = projectionManager.getMediaProjection(resultCode, data)
 
-            // 获取屏幕参数
+            if (mediaProjection == null) {
+                Log.e(TAG, "Failed to create MediaProjection")
+                cleanup()
+                return
+            }
+
             val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
             val screenWidth: Int
             val screenHeight: Int
@@ -118,11 +104,9 @@ class ScreenCaptureService : Service() {
                 screenDensity = metrics.densityDpi
             }
 
-            // 创建后台线程
             handlerThread = HandlerThread("ScreenCapture").also { it.start() }
             handler = Handler(handlerThread!!.looper)
 
-            // 创建 ImageReader
             imageReader = ImageReader.newInstance(
                 screenWidth, screenHeight,
                 PixelFormat.RGBA_8888, 2
@@ -136,22 +120,18 @@ class ScreenCaptureService : Service() {
                 try {
                     hasCaptured = true
                     val bitmap = imageToBitmap(image)
-
-                    // 使用静态字段传递 Bitmap
                     MainActivity.capturedBitmap = bitmap
+                    Log.d(TAG, "Screenshot captured: ${bitmap.width}x${bitmap.height}")
 
-                    // 延迟停止服务
-                    handler?.postDelayed({
-                        cleanup()
-                    }, 500)
+                    handler?.postDelayed({ cleanup() }, 500)
                 } catch (e: Exception) {
+                    Log.e(TAG, "Capture error: ${e.message}", e)
                     cleanup()
                 } finally {
                     image.close()
                 }
             }, handler)
 
-            // 创建虚拟显示器
             virtualDisplay = mediaProjection!!.createVirtualDisplay(
                 "ScreenCapture",
                 screenWidth, screenHeight, screenDensity,
@@ -159,7 +139,10 @@ class ScreenCaptureService : Service() {
                 imageReader!!.surface,
                 null, handler
             )
+
+            Log.d(TAG, "VirtualDisplay created: ${screenWidth}x${screenHeight}")
         } catch (e: Exception) {
+            Log.e(TAG, "startCapture error: ${e.message}", e)
             cleanup()
         }
     }
@@ -190,19 +173,13 @@ class ScreenCaptureService : Service() {
     private fun cleanup() {
         try { virtualDisplay?.release() } catch (_: Exception) {}
         virtualDisplay = null
-
         try { imageReader?.close() } catch (_: Exception) {}
         imageReader = null
-
         try { handlerThread?.quitSafely() } catch (_: Exception) {}
         handlerThread = null
-
         try { mediaProjection?.stop() } catch (_: Exception) {}
         mediaProjection = null
-
-        try {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-        } catch (_: Exception) {
+        try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {
             @Suppress("DEPRECATION")
             try { stopForeground(true) } catch (_: Exception) {}
         }
@@ -212,29 +189,21 @@ class ScreenCaptureService : Service() {
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
-                CHANNEL_ID,
-                "屏幕截图",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "用于屏幕截图的前台服务通知"
-                setShowBadge(false)
-            }
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
+                CHANNEL_ID, "屏幕截图", NotificationManager.IMPORTANCE_LOW
+            ).apply { setShowBadge(false) }
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
     }
 
     private fun buildNotification(): Notification {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            return Notification.Builder(this, CHANNEL_ID)
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle("正在截图")
-                .setContentText("快速查找正在截取屏幕")
                 .setSmallIcon(android.R.drawable.ic_menu_camera)
                 .build()
         } else {
-            return Notification.Builder(this)
+            Notification.Builder(this)
                 .setContentTitle("正在截图")
-                .setContentText("快速查找正在截取屏幕")
                 .setSmallIcon(android.R.drawable.ic_menu_camera)
                 .build()
         }

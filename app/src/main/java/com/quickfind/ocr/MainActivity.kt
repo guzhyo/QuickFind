@@ -1,15 +1,37 @@
 package com.quickfind.ocr
 
 import android.app.Activity
+import android.app.Application
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Bundle
+import android.util.Log
 import android.view.View
 import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import kotlinx.coroutines.*
+
+/**
+ * 全局异常捕获 - 显示崩溃原因而不是直接闪退
+ */
+class QuickFindApp : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            Log.e("QuickFind", "CRASH: ${throwable.message}", throwable)
+            // 将崩溃信息保存到静态字段，下次启动时显示
+            lastCrashMessage = throwable.message ?: "未知错误"
+            lastCrashDetail = Log.getStackTraceString(throwable)
+        }
+    }
+
+    companion object {
+        var lastCrashMessage: String? = null
+        var lastCrashDetail: String? = null
+    }
+}
 
 class MainActivity : AppCompatActivity() {
 
@@ -34,8 +56,11 @@ class MainActivity : AppCompatActivity() {
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     companion object {
-        // 静态字段传递 Bitmap，避免 Intent 大小限制
         var capturedBitmap: Bitmap? = null
+
+        // 静态字段传递 MediaProjection 数据，避免 Intent 序列化问题
+        var pendingResultCode: Int = -1
+        var pendingResultData: Intent? = null
     }
 
     // 文件选择器
@@ -48,6 +73,12 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+
+        // 检查上次崩溃信息
+        val crashMsg = QuickFindApp.lastCrashMessage
+        val crashDetail = QuickFindApp.lastCrashDetail
+        QuickFindApp.lastCrashMessage = null
+        QuickFindApp.lastCrashDetail = null
 
         // 初始化视图
         tvTitle = findViewById(R.id.tvTitle)
@@ -74,7 +105,7 @@ class MainActivity : AppCompatActivity() {
         // 按钮事件
         btnOpenFile.setOnClickListener {
             try {
-                filePickerLauncher.launch(arrayOf("text/plain", "text/*", "*/*"))
+                filePickerLauncher.launch(arrayOf("*/*"))
             } catch (e: Exception) {
                 showStatus("无法打开文件选择器: ${e.message}")
             }
@@ -87,13 +118,11 @@ class MainActivity : AppCompatActivity() {
                 showStatus("截图请求失败: ${e.message}")
             }
         }
-    }
 
-    private fun startScreenCapture() {
-        try {
-            captureManager.requestScreenCapture(this)
-        } catch (e: Exception) {
-            showStatus("截图请求失败: ${e.message}")
+        // 显示上次崩溃信息
+        if (crashMsg != null) {
+            showStatus("上次崩溃: $crashMsg")
+            tvFileContent.text = "崩溃详情:\n$crashDetail"
         }
     }
 
@@ -104,10 +133,14 @@ class MainActivity : AppCompatActivity() {
         if (requestCode == ScreenCaptureManager.REQUEST_CODE_SCREEN_CAPTURE) {
             if (resultCode == Activity.RESULT_OK && data != null) {
                 try {
-                    captureManager.startCapture(resultCode, data)
+                    // 使用静态字段传递数据
+                    pendingResultCode = resultCode
+                    pendingResultData = data
+                    captureManager.startCapture()
                     showStatus("正在截图...")
                 } catch (e: Exception) {
                     showStatus("截图失败: ${e.message}")
+                    Log.e("QuickFind", "startCapture error", e)
                 }
             } else {
                 showStatus("截图权限被拒绝")
@@ -148,6 +181,7 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 showLoading(null)
                 showStatus("打开文件失败: ${e.message}")
+                Log.e("QuickFind", "loadFile error", e)
             }
         }
     }
@@ -175,7 +209,6 @@ class MainActivity : AppCompatActivity() {
                     if (results.isNotEmpty()) {
                         tvSearchSummary.visibility = View.VISIBLE
                         tvSearchSummary.text = "找到 ${results.size} 个匹配结果 (关键词: ${query.take(30)})"
-                        // 显示带高亮的文件内容
                         highlightSearchResults(results)
                     } else {
                         tvSearchSummary.visibility = View.VISIBLE
@@ -187,6 +220,7 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 showLoading(null)
                 showStatus("识别失败: ${e.message}")
+                Log.e("QuickFind", "processScreenshot error", e)
             }
         }
     }
@@ -209,9 +243,9 @@ class MainActivity : AppCompatActivity() {
             if (start >= end) continue
 
             val color = when {
-                result.similarity > 0.9f -> 0xFFFFFF00.toInt() // 黄色
-                result.similarity > 0.7f -> 0xFFFFFF99.toInt() // 浅黄
-                else -> 0xFFFFFFCC.toInt() // 淡黄
+                result.similarity > 0.9f -> 0xFFFFFF00.toInt()
+                result.similarity > 0.7f -> 0xFFFFFF99.toInt()
+                else -> 0xFFFFFFCC.toInt()
             }
             spannable.setSpan(
                 android.text.style.BackgroundColorSpan(color),

@@ -17,9 +17,6 @@ class ScreenCaptureManager(private val context: Context) {
 
     var onError: ((String) -> Unit)? = null
 
-    /**
-     * 发起屏幕截图权限请求
-     */
     fun requestScreenCapture(activity: Activity) {
         val projectionManager = activity.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         activity.startActivityForResult(
@@ -29,13 +26,19 @@ class ScreenCaptureManager(private val context: Context) {
     }
 
     /**
-     * 处理权限结果，启动前台服务进行截图
+     * 使用静态字段中的 resultCode 和 data 启动截图服务
      */
-    fun startCapture(resultCode: Int, data: Intent?) {
-        if (resultCode != Activity.RESULT_OK || data == null) return
+    fun startCapture() {
+        val resultCode = MainActivity.pendingResultCode
+        val data = MainActivity.pendingResultData
+
+        if (resultCode == -1 || data == null) {
+            onError?.invoke("截图数据无效")
+            return
+        }
 
         try {
-            val serviceIntent = ScreenCaptureService.createIntent(context, resultCode, data)
+            val serviceIntent = Intent(context, ScreenCaptureService::class.java)
             context.startForegroundService(serviceIntent)
         } catch (e: SecurityException) {
             onError?.invoke("需要通知权限才能截图，请在设置中开启")
