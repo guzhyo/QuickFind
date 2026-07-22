@@ -9,28 +9,16 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.shrinkVertically
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -43,37 +31,30 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.BufferedReader
-import java.io.InputStreamReader
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var ocrEngine: OcrEngine
     private lateinit var captureManager: ScreenCaptureManager
 
+    // 用 Activity 级别的回调，避免 DisposableEffect
+    var onBitmapCaptured: ((Bitmap) -> Unit)? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        ocrEngine = OcrEngine()
-        captureManager = ScreenCaptureManager(this)
+        try {
+            ocrEngine = OcrEngine()
+            captureManager = ScreenCaptureManager(this)
+        } catch (e: Exception) {
+            Toast.makeText(this, "初始化失败: ${e.message}", Toast.LENGTH_LONG).show()
+            finish()
+            return
+        }
 
         setContent {
-            MaterialTheme(
-                colorScheme = lightColorScheme(
-                    primary = Color(0xFF1976D2),
-                    onPrimary = Color.White,
-                    primaryContainer = Color(0xFFBBDEFB),
-                    secondary = Color(0xFF455A64),
-                    background = Color(0xFFF5F5F5),
-                    surface = Color.White,
-                    error = Color(0xFFD32F2F)
-                )
-            ) {
-                MainScreen(
-                    ocrEngine = ocrEngine,
-                    captureManager = captureManager,
-                    activity = this
-                )
+            MaterialTheme {
+                QuickFindApp()
             }
         }
     }
@@ -82,720 +63,375 @@ class MainActivity : ComponentActivity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == ScreenCaptureManager.REQUEST_CODE_SCREEN_CAPTURE) {
-            if (resultCode == Activity.RESULT_OK) {
-                captureManager.startCapture(resultCode, data) { bitmap ->
-                    runOnUiThread {
-                        if (bitmap != null) {
-                            // 通过全局回调传递截图
-                            MainActivity.pendingBitmap = bitmap
-                            MainActivity.onBitmapCaptured?.invoke(bitmap)
-                        } else {
-                            Toast.makeText(this, "截图失败", Toast.LENGTH_SHORT).show()
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                try {
+                    captureManager.startCapture(resultCode, data) { bitmap ->
+                        runOnUiThread {
+                            if (bitmap != null) {
+                                onBitmapCaptured?.invoke(bitmap)
+                            }
                         }
                     }
+                } catch (e: Exception) {
+                    Toast.makeText(this, "截图失败: ${e.message}", Toast.LENGTH_SHORT).show()
                 }
-            } else {
-                Toast.makeText(this, "截图权限被拒绝", Toast.LENGTH_SHORT).show()
             }
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        ocrEngine.close()
-        captureManager.release()
+        try {
+            ocrEngine.close()
+            captureManager.release()
+        } catch (_: Exception) {}
     }
 
-    companion object {
-        var pendingBitmap: Bitmap? = null
-        var onBitmapCaptured: ((Bitmap) -> Unit)? = null
-    }
-}
+    // ==================== 主界面 ====================
 
-// ==================== 主界面 ====================
+    @Composable
+    fun QuickFindApp() {
+        val context = LocalContext.current
+        val scope = rememberCoroutineScope()
 
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun MainScreen(
-    ocrEngine: OcrEngine,
-    captureManager: ScreenCaptureManager,
-    activity: MainActivity
-) {
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
+        var fileName by remember { mutableStateOf("") }
+        var fileContent by remember { mutableStateOf("") }
+        var ocrText by remember { mutableStateOf("") }
+        var searchQuery by remember { mutableStateOf("") }
+        var searchResults by remember { mutableStateOf<List<FuzzySearch.SearchResult>>(emptyList()) }
+        var isLoading by remember { mutableStateOf(false) }
+        var statusMessage by remember { mutableStateOf("") }
 
-    // 状态
-    var fileName by remember { mutableStateOf("") }
-    var fileContent by remember { mutableStateOf("") }
-    var ocrText by remember { mutableStateOf("") }
-    var searchQuery by remember { mutableStateOf("") }
-    var searchResults by remember { mutableStateOf<List<FuzzySearch.SearchResult>>(emptyList()) }
-    var isLoading by remember { mutableStateOf(false) }
-    var loadingMessage by remember { mutableStateOf("") }
-    var showOcrResult by remember { mutableStateOf(false) }
-    var showSearchPanel by remember { mutableStateOf(false) }
-    var similarityThreshold by remember { mutableStateOf(0.6f) }
-    var selectedTabIndex by remember { mutableStateOf(0) }
+        // 文件选择器 - 使用 */* 兼容所有文件管理器
+        val filePickerLauncher = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.OpenDocument()
+        ) { uri: Uri? ->
+            if (uri != null) {
+                scope.launch {
+                    try {
+                        isLoading = true
+                        statusMessage = "正在读取文件..."
 
-    // 文件选择器
-    val filePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri: Uri? ->
-        uri?.let {
-            scope.launch {
-                try {
-                    isLoading = true
-                    loadingMessage = "正在读取文件..."
-                    val (name, content) = withContext(Dispatchers.IO) {
-                        readTextFile(context, it)
+                        val (name, content) = withContext(Dispatchers.IO) {
+                            readTextFile(context, uri)
+                        }
+
+                        fileName = name
+                        fileContent = content
+                        searchResults = emptyList()
+                        ocrText = ""
+                        statusMessage = "已加载: $name (${content.length} 字符)"
+                        isLoading = false
+                    } catch (e: Exception) {
+                        isLoading = false
+                        statusMessage = "打开失败: ${e.message}"
                     }
-                    fileName = name
-                    fileContent = content
-                    searchResults = emptyList()
-                    showOcrResult = false
-                    showSearchPanel = false
-                    isLoading = false
-                } catch (e: Exception) {
-                    isLoading = false
-                    Toast.makeText(context, "打开文件失败: ${e.message}", Toast.LENGTH_LONG).show()
                 }
             }
         }
-    }
 
-    // 截图回调
-    DisposableEffect(Unit) {
-        MainActivity.onBitmapCaptured = { bitmap ->
-            scope.launch {
-                isLoading = true
-                loadingMessage = "正在进行 OCR 识别..."
+        // 截图回调 - 直接设置在 Activity 上
+        remember {
+            this@MainActivity.onBitmapCaptured = { bitmap ->
+                scope.launch {
+                    try {
+                        isLoading = true
+                        statusMessage = "正在 OCR 识别..."
 
-                val (text, confidence) = ocrEngine.recognizeTextWithConfidence(bitmap)
-                ocrText = text
-                showOcrResult = true
-                searchQuery = text.lines().firstOrNull { it.isNotBlank() }?.trim() ?: text
+                        val (text, _) = withContext(Dispatchers.Default) {
+                            ocrEngine.recognizeTextWithConfidence(bitmap)
+                        }
+                        ocrText = text
+                        searchQuery = text.lines().firstOrNull { it.isNotBlank() }?.trim() ?: ""
 
-                isLoading = false
-                showSearchPanel = true
-
-                if (fileContent.isNotEmpty() && searchQuery.isNotEmpty()) {
-                    loadingMessage = "正在搜索..."
-                    isLoading = true
-                    searchResults = withContext(Dispatchers.Default) {
-                        FuzzySearch.search(searchQuery, fileContent, similarityThreshold)
+                        // 自动搜索
+                        if (fileContent.isNotEmpty() && searchQuery.isNotEmpty()) {
+                            statusMessage = "正在搜索..."
+                            searchResults = withContext(Dispatchers.Default) {
+                                FuzzySearch.search(searchQuery, fileContent, 0.6f)
+                            }
+                            statusMessage = "识别完成，找到 ${searchResults.size} 个匹配"
+                        } else {
+                            statusMessage = "识别完成"
+                        }
+                        isLoading = false
+                    } catch (e: Exception) {
+                        isLoading = false
+                        statusMessage = "识别失败: ${e.message}"
                     }
-                    isLoading = false
                 }
-
-                Toast.makeText(context, "OCR 识别完成", Toast.LENGTH_SHORT).show()
             }
         }
-        onDispose {
-            MainActivity.onBitmapCaptured = null
-        }
-    }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text("快速查找", fontWeight = FontWeight.Bold)
-                        if (fileName.isNotEmpty()) {
-                            Text(
-                                fileName,
-                                fontSize = 12.sp,
-                                color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.8f),
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = {
+                        Text(
+                            if (fileName.isNotEmpty()) fileName else "快速查找",
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                     }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.primary,
-                    titleContentColor = MaterialTheme.colorScheme.onPrimary
-                ),
-                actions = {
-                    if (fileContent.isNotEmpty()) {
-                        IconButton(onClick = {
-                            showSearchPanel = !showSearchPanel
-                        }) {
-                            Icon(Icons.Default.Search, contentDescription = "搜索")
-                        }
-                    }
-                }
-            )
-        },
-        bottomBar = {
-            // 底部操作栏
-            Surface(
-                shadowElevation = 8.dp,
-                color = MaterialTheme.colorScheme.surface
+                )
+            }
+        ) { padding ->
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding)
+                    .padding(16.dp)
+                    .verticalScroll(rememberScrollState())
             ) {
+                // 状态消息
+                if (statusMessage.isNotEmpty()) {
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 12.dp),
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant
+                    ) {
+                        Text(
+                            statusMessage,
+                            modifier = Modifier.padding(12.dp),
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+                }
+
+                // 加载指示
+                if (isLoading) {
+                    LinearProgressIndicator(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 12.dp)
+                    )
+                }
+
+                // 操作按钮
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 12.dp),
-                    horizontalArrangement = Arrangement.SpaceEvenly
+                        .padding(bottom = 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    // 打开文件按钮
-                    OutlinedButton(
+                    Button(
                         onClick = {
-                            filePickerLauncher.launch(arrayOf("text/*", "application/text"))
+                            try {
+                                filePickerLauncher.launch(arrayOf("*/*"))
+                            } catch (e: Exception) {
+                                statusMessage = "无法打开文件选择器: ${e.message}"
+                            }
                         },
                         modifier = Modifier.weight(1f)
                     ) {
-                        Icon(Icons.Default.Description, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(6.dp))
                         Text(if (fileName.isEmpty()) "打开TXT" else "更换文件")
                     }
 
-                    Spacer(Modifier.width(12.dp))
-
-                    // 截图识别按钮
                     Button(
                         onClick = {
-                            captureManager.requestScreenCapture(activity)
+                            try {
+                                captureManager.requestScreenCapture(this@MainActivity)
+                            } catch (e: Exception) {
+                                statusMessage = "截图请求失败: ${e.message}"
+                            }
                         },
                         modifier = Modifier.weight(1f)
                     ) {
-                        Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(6.dp))
                         Text("截图识别")
                     }
                 }
-            }
-        }
-    ) { paddingValues ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(paddingValues)
-        ) {
-            // 加载指示器
-            AnimatedVisibility(
-                visible = isLoading,
-                enter = expandVertically(),
-                exit = shrinkVertically()
-            ) {
-                LinearProgressIndicator(
-                    modifier = Modifier.fillMaxWidth(),
-                    color = MaterialTheme.colorScheme.primary
-                )
-                Text(
-                    loadingMessage,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f))
-                        .padding(8.dp),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.primary
-                )
-            }
 
-            // 主内容区域
-            if (fileContent.isEmpty() && !showOcrResult) {
-                // 空状态提示
-                EmptyStateView()
-            } else {
-                // Tab 切换
-                if (showOcrResult && fileContent.isNotEmpty()) {
-                    TabRow(selectedTabIndex = selectedTabIndex) {
-                        Tab(
-                            selected = selectedTabIndex == 0,
-                            onClick = { selectedTabIndex = 0 },
-                            text = { Text("文件内容") }
-                        )
-                        Tab(
-                            selected = selectedTabIndex == 1,
-                            onClick = { selectedTabIndex = 1 },
-                            text = { Text("搜索结果 (${searchResults.size})") }
-                        )
-                        Tab(
-                            selected = selectedTabIndex == 2,
-                            onClick = { selectedTabIndex = 2 },
-                            text = { Text("OCR 文本") }
+                // OCR 文本和搜索
+                if (ocrText.isNotEmpty()) {
+                    Text("OCR 识别结果:", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                    Spacer(Modifier.height(4.dp))
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.secondaryContainer
+                    ) {
+                        Text(
+                            ocrText,
+                            modifier = Modifier.padding(12.dp),
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 13.sp
                         )
                     }
+                    Spacer(Modifier.height(16.dp))
                 }
 
-                when {
-                    selectedTabIndex == 0 || !showOcrResult -> {
-                        // 文件内容显示
-                        FileContentView(fileContent, searchResults)
-                    }
-                    selectedTabIndex == 1 -> {
-                        // 搜索结果显示
-                        SearchResultView(
-                            results = searchResults,
-                            fileContent = fileContent,
-                            onResultClick = { /* 可跳转到对应位置 */ }
-                        )
-                    }
-                    selectedTabIndex == 2 -> {
-                        // OCR 文本显示
-                        OcrTextView(ocrText)
-                    }
+                // 搜索结果摘要
+                if (searchResults.isNotEmpty()) {
+                    Text(
+                        "找到 ${searchResults.size} 个匹配结果",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 16.sp,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(Modifier.height(8.dp))
                 }
-            }
 
-            // 搜索面板
-            AnimatedVisibility(
-                visible = showSearchPanel && fileContent.isNotEmpty(),
-                enter = expandVertically(),
-                exit = shrinkVertically()
-            ) {
-                SearchPanel(
-                    query = searchQuery,
-                    onQueryChange = { searchQuery = it },
-                    threshold = similarityThreshold,
-                    onThresholdChange = { similarityThreshold = it },
-                    onSearch = {
-                        if (searchQuery.isNotBlank() && fileContent.isNotEmpty()) {
-                            scope.launch {
-                                isLoading = true
-                                loadingMessage = "正在模糊搜索..."
-                                searchResults = withContext(Dispatchers.Default) {
-                                    FuzzySearch.search(searchQuery, fileContent, similarityThreshold)
-                                }
-                                isLoading = false
-                                selectedTabIndex = 1
+                // 文件内容
+                if (fileContent.isNotEmpty()) {
+                    Text("文件内容:", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                    Spacer(Modifier.height(4.dp))
+
+                    // 限制显示大小
+                    val displayText = if (fileContent.length > 100_000) {
+                        fileContent.substring(0, 100_000) + "\n\n... [文件过大，仅显示前10万字符]"
+                    } else {
+                        fileContent
+                    }
+
+                    // 构建带高亮文本
+                    val annotatedText = if (searchResults.isEmpty()) {
+                        buildAnnotatedString {
+                            withStyle(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp)) {
+                                append(displayText)
                             }
                         }
+                    } else {
+                        buildHighlightedText(displayText, searchResults)
                     }
-                )
+
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.surface
+                    ) {
+                        Text(
+                            annotatedText,
+                            modifier = Modifier.padding(12.dp),
+                            lineHeight = 20.sp
+                        )
+                    }
+                }
+
+                // 空状态
+                if (fileContent.isEmpty() && ocrText.isEmpty()) {
+                    Spacer(Modifier.height(40.dp))
+                    Text(
+                        "使用说明:\n\n" +
+                        "1. 点击「打开TXT」选择文本文件\n" +
+                        "2. 点击「截图识别」截取屏幕文字\n" +
+                        "3. 自动在文件中模糊搜索匹配内容\n\n" +
+                        "提示: 降低搜索阈值可找到更多匹配结果",
+                        color = Color.Gray,
+                        lineHeight = 24.sp
+                    )
+                }
+
+                // 底部留白
+                Spacer(Modifier.height(32.dp))
             }
         }
     }
-}
 
-// ==================== 空状态视图 ====================
+    // ==================== 高亮文本构建 ====================
 
-@Composable
-fun EmptyStateView() {
-    Box(
-        modifier = Modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center
-    ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier.padding(32.dp)
-        ) {
-            Icon(
-                Icons.Default.Search,
-                contentDescription = null,
-                modifier = Modifier.size(80.dp),
-                tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.3f)
-            )
-            Spacer(Modifier.height(16.dp))
-            Text(
-                "快速查找",
-                style = MaterialTheme.typography.headlineMedium,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
-            )
-            Spacer(Modifier.height(8.dp))
-            Text(
-                "1. 点击下方「打开TXT」选择文本文件\n2. 点击「截图识别」进行屏幕截图 OCR\n3. 自动在文件中模糊搜索识别文字",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f),
-                lineHeight = 22.sp
-            )
-        }
-    }
-}
+    private fun buildHighlightedText(
+        content: String,
+        results: List<FuzzySearch.SearchResult>
+    ): androidx.compose.ui.text.AnnotatedString {
+        return try {
+            buildAnnotatedString {
+                val sorted = results.sortedBy { it.position }
+                    .filter { it.position < content.length && it.length > 0 }
 
-// ==================== 文件内容视图 ====================
-
-@Composable
-fun FileContentView(content: String, searchResults: List<FuzzySearch.SearchResult>) {
-    val scrollState = rememberScrollState()
-
-    // 限制显示内容大小，防止大文件 OOM
-    val displayContent = if (content.length > 200_000) {
-        content.take(200_000) + "\n\n... [文件过大，仅显示前 200,000 字符] ..."
-    } else {
-        content
-    }
-
-    // 构建带高亮的文本
-    val annotatedText = try {
-        buildAnnotatedString {
-            if (searchResults.isEmpty()) {
-                withStyle(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp)) {
-                    append(displayContent)
-                }
-            } else {
-                val sortedResults = searchResults.sortedBy { it.position }
-                    .filter { it.position < displayContent.length }
                 var lastEnd = 0
+                for (result in sorted) {
+                    val start = result.position.coerceIn(lastEnd, content.length)
+                    val end = (start + result.length).coerceAtMost(content.length)
+                    if (start >= end) continue
 
-                for (result in sortedResults) {
-                    val start = result.position.coerceAtLeast(lastEnd)
-                    val end = (start + result.length).coerceAtMost(displayContent.length)
-                    if (start >= end || start >= displayContent.length) continue
-
+                    // 普通文本
                     if (start > lastEnd) {
                         withStyle(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp)) {
-                            append(displayContent.substring(lastEnd, start))
+                            append(content.substring(lastEnd, start))
                         }
                     }
 
+                    // 高亮
                     val bgColor = when {
                         result.similarity > 0.9f -> Color(0xFFFFEB3B)
                         result.similarity > 0.7f -> Color(0xFFFFF176)
                         else -> Color(0xFFFFF9C4)
                     }
-
-                    withStyle(
-                        SpanStyle(
-                            background = bgColor,
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 13.sp
-                        )
-                    ) {
-                        append(displayContent.substring(start, end))
+                    withStyle(SpanStyle(
+                        background = bgColor,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 13.sp
+                    )) {
+                        append(content.substring(start, end))
                     }
-
                     lastEnd = end
                 }
 
-                if (lastEnd < displayContent.length) {
+                if (lastEnd < content.length) {
                     withStyle(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp)) {
-                        append(displayContent.substring(lastEnd))
+                        append(content.substring(lastEnd))
                     }
                 }
             }
-        }
-    } catch (e: Exception) {
-        buildAnnotatedString {
-            withStyle(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp)) {
-                append(displayContent)
+        } catch (e: Exception) {
+            buildAnnotatedString {
+                withStyle(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp)) {
+                    append(content)
+                }
             }
         }
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(scrollState)
-            .padding(12.dp)
-    ) {
-        if (searchResults.isNotEmpty()) {
-            // 搜索摘要
-            Surface(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 8.dp),
-                shape = RoundedCornerShape(8.dp),
-                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f)
-            ) {
-                Text(
-                    "找到 ${searchResults.size} 个匹配结果（最高相似度: ${(searchResults.maxOf { it.similarity } * 100).toInt()}%）",
-                    modifier = Modifier.padding(8.dp),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.primary
-                )
-            }
-        }
+    // ==================== 文件读取 ====================
 
-        Text(
-            annotatedText,
-            lineHeight = 20.sp
-        )
-    }
-}
+    companion object {
+        private const val MAX_FILE_SIZE = 2 * 1024 * 1024 // 2MB
 
-// ==================== 搜索结果视图 ====================
+        fun readTextFile(context: Context, uri: Uri): Pair<String, String> {
+            // 获取文件名
+            val displayName = try {
+                context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                        if (idx >= 0) cursor.getString(idx) else null
+                    } else null
+                }
+            } catch (_: Exception) { null }
+            val fileName = displayName ?: uri.lastPathSegment ?: "未知文件"
 
-@Composable
-fun SearchResultView(
-    results: List<FuzzySearch.SearchResult>,
-    fileContent: String,
-    onResultClick: (FuzzySearch.SearchResult) -> Unit
-) {
-    if (results.isEmpty()) {
-        Box(
-            modifier = Modifier.fillMaxSize(),
-            contentAlignment = Alignment.Center
-        ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Icon(
-                    Icons.Default.SearchOff,
-                    contentDescription = null,
-                    modifier = Modifier.size(48.dp),
-                    tint = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.3f)
-                )
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    "未找到匹配结果",
-                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f)
-                )
-                Text(
-                    "尝试降低相似度阈值",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.4f)
-                )
-            }
-        }
-        return
-    }
-
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(8.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp)
-    ) {
-        itemsIndexed(results) { index, result ->
-            Surface(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { onResultClick(result) },
-                shape = RoundedCornerShape(8.dp),
-                tonalElevation = 1.dp
-            ) {
-                Column(modifier = Modifier.padding(12.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            "#${index + 1}",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                        // 相似度标签
-                        Surface(
-                            shape = RoundedCornerShape(12.dp),
-                            color = when {
-                                result.similarity > 0.9f -> Color(0xFF4CAF50)
-                                result.similarity > 0.7f -> Color(0xFFFF9800)
-                                else -> Color(0xFFFF5722)
+            // 读取内容
+            val content = try {
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    val buffer = ByteArray(MAX_FILE_SIZE)
+                    val totalRead = input.read(buffer)
+                    if (totalRead <= 0) {
+                        "文件为空"
+                    } else {
+                        val bytes = buffer.copyOf(totalRead)
+                        // 尝试 UTF-8
+                        val text = String(bytes, Charsets.UTF_8)
+                        // 检查是否有乱码标记，尝试 GBK
+                        if (text.contains('\uFFFD') && totalRead < 100_000) {
+                            try {
+                                String(bytes, charset("GBK"))
+                            } catch (_: Exception) {
+                                text
                             }
-                        ) {
-                            Text(
-                                "${(result.similarity * 100).toInt()}%",
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = Color.White
-                            )
+                        } else {
+                            text
                         }
                     }
-
-                    Spacer(Modifier.height(4.dp))
-
-                    // 匹配的文本
-                    Text(
-                        result.matchedText,
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Medium,
-                        fontFamily = FontFamily.Monospace,
-                        maxLines = 3,
-                        overflow = TextOverflow.Ellipsis
-                    )
-
-                    // 上下文预览
-                    val contextStart = maxOf(0, result.position - 20)
-                    val contextEnd = minOf(fileContent.length, result.position + result.length + 20)
-                    val beforeContext = fileContent.substring(contextStart, result.position)
-                    val afterContext = fileContent.substring(
-                        result.position + result.length,
-                        contextEnd
-                    )
-
-                    Text(
-                        buildAnnotatedString {
-                            withStyle(SpanStyle(color = Color.Gray, fontSize = 11.sp)) {
-                                append("...$beforeContext")
-                            }
-                            withStyle(SpanStyle(
-                                color = MaterialTheme.colorScheme.primary,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 11.sp
-                            )) {
-                                append(result.matchedText)
-                            }
-                            withStyle(SpanStyle(color = Color.Gray, fontSize = 11.sp)) {
-                                append("$afterContext...")
-                            }
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-
-                    // 位置信息
-                    Text(
-                        "位置: ${result.position}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
-                    )
-                }
+                } ?: "无法打开文件"
+            } catch (e: SecurityException) {
+                "没有读取权限"
+            } catch (e: Exception) {
+                "读取失败: ${e.message}"
             }
+
+            return Pair(fileName, content)
         }
     }
-}
-
-// ==================== OCR 文本视图 ====================
-
-@Composable
-fun OcrTextView(text: String) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp)
-    ) {
-        Surface(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(8.dp),
-            color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.3f)
-        ) {
-            Column(modifier = Modifier.padding(12.dp)) {
-                Text(
-                    "OCR 识别结果",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.Bold
-                )
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    "以下文字从屏幕截图中识别，可直接编辑后搜索",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
-                )
-            }
-        }
-
-        Spacer(Modifier.height(12.dp))
-
-        Text(
-            text.ifEmpty { "暂无识别结果" },
-            style = MaterialTheme.typography.bodyMedium.copy(
-                fontFamily = FontFamily.Monospace,
-                lineHeight = 22.sp
-            )
-        )
-    }
-}
-
-// ==================== 搜索面板 ====================
-
-@Composable
-fun SearchPanel(
-    query: String,
-    onQueryChange: (String) -> Unit,
-    threshold: Float,
-    onThresholdChange: (Float) -> Unit,
-    onSearch: () -> Unit
-) {
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shadowElevation = 4.dp,
-        color = MaterialTheme.colorScheme.surface
-    ) {
-        Column(modifier = Modifier.padding(12.dp)) {
-            // 搜索输入框
-            OutlinedTextField(
-                value = query,
-                onValueChange = onQueryChange,
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("搜索关键词") },
-                placeholder = { Text("输入或修改 OCR 识别文字") },
-                trailingIcon = {
-                    IconButton(onClick = onSearch) {
-                        Icon(Icons.Default.Search, contentDescription = "搜索")
-                    }
-                },
-                maxLines = 3,
-                textStyle = MaterialTheme.typography.bodyMedium
-            )
-
-            Spacer(Modifier.height(8.dp))
-
-            // 相似度阈值滑块
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    "模糊度:",
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.width(50.dp)
-                )
-                Slider(
-                    value = threshold,
-                    onValueChange = onThresholdChange,
-                    modifier = Modifier.weight(1f),
-                    valueRange = 0.3f..1.0f,
-                    steps = 6
-                )
-                Text(
-                    "${(threshold * 100).toInt()}%",
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.width(40.dp)
-                )
-            }
-
-            Text(
-                "降低模糊度可匹配更多结果（适合 OCR 误差较大的情况）",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
-            )
-        }
-    }
-}
-
-// ==================== 工具函数 ====================
-
-/** 最大读取文件大小: 2MB */
-private const val MAX_FILE_SIZE = 2 * 1024 * 1024
-
-/**
- * 读取 TXT 文件内容
- * 支持 UTF-8 / GBK 编码自动检测，限制最大 2MB
- */
-fun readTextFile(context: Context, uri: Uri): Pair<String, String> {
-    // 提取文件名
-    val fileName = try {
-        val cursor = context.contentResolver.query(uri, null, null, null, null)
-        cursor?.use {
-            if (it.moveToFirst()) {
-                val nameIndex = it.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-                if (nameIndex >= 0) it.getString(nameIndex) else uri.lastPathSegment ?: "未知文件"
-            } else "未知文件"
-        } ?: (uri.lastPathSegment ?: "未知文件")
-    } catch (e: Exception) {
-        uri.lastPathSegment ?: "未知文件"
-    }
-
-    val content = try {
-        context.contentResolver.openInputStream(uri)?.use { inputStream ->
-            // 读取前 2MB
-            val buffer = ByteArray(MAX_FILE_SIZE)
-            val bytesRead = inputStream.read(buffer)
-            if (bytesRead <= 0) {
-                "文件为空"
-            } else {
-                val bytes = if (bytesRead < MAX_FILE_SIZE) {
-                    buffer.copyOf(bytesRead)
-                } else {
-                    buffer
-                }
-                // 尝试 UTF-8，失败则用 GBK
-                try {
-                    String(bytes, Charsets.UTF_8)
-                } catch (e: Exception) {
-                    String(bytes, charset("GBK"))
-                }
-            }
-        } ?: "无法读取文件"
-    } catch (e: SecurityException) {
-        "没有权限读取该文件"
-    } catch (e: Exception) {
-        "读取文件失败: ${e.message}"
-    }
-    return Pair(fileName, content)
 }
