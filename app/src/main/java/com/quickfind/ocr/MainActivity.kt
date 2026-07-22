@@ -90,6 +90,7 @@ class MainActivity : ComponentActivity() {
 
     // ==================== 主界面 ====================
 
+    @OptIn(ExperimentalMaterial3Api::class)
     @Composable
     fun QuickFindApp() {
         val context = LocalContext.current
