@@ -135,7 +135,7 @@ fun MainScreen(
     var showOcrResult by remember { mutableStateOf(false) }
     var showSearchPanel by remember { mutableStateOf(false) }
     var similarityThreshold by remember { mutableStateOf(0.6f) }
-    var selectedTabIndex by remember { mutableIntStateOf(0) }
+    var selectedTabIndex by remember { mutableStateOf(0) }
 
     // 文件选择器
     val filePickerLauncher = rememberLauncherForActivityResult(
@@ -143,16 +143,22 @@ fun MainScreen(
     ) { uri: Uri? ->
         uri?.let {
             scope.launch {
-                isLoading = true
-                loadingMessage = "正在读取文件..."
-                val (name, content) = withContext(Dispatchers.IO) {
-                    readTextFile(context, it)
+                try {
+                    isLoading = true
+                    loadingMessage = "正在读取文件..."
+                    val (name, content) = withContext(Dispatchers.IO) {
+                        readTextFile(context, it)
+                    }
+                    fileName = name
+                    fileContent = content
+                    searchResults = emptyList()
+                    showOcrResult = false
+                    showSearchPanel = false
+                    isLoading = false
+                } catch (e: Exception) {
+                    isLoading = false
+                    Toast.makeText(context, "打开文件失败: ${e.message}", Toast.LENGTH_LONG).show()
                 }
-                fileName = name
-                fileContent = content
-                searchResults = emptyList()
-                showSearchPanel = false
-                isLoading = false
             }
         }
     }
@@ -236,7 +242,7 @@ fun MainScreen(
                     // 打开文件按钮
                     OutlinedButton(
                         onClick = {
-                            filePickerLauncher.launch(arrayOf("text/plain"))
+                            filePickerLauncher.launch(arrayOf("text/*", "application/text"))
                         },
                         modifier = Modifier.weight(1f)
                     ) {
@@ -406,58 +412,67 @@ fun EmptyStateView() {
 fun FileContentView(content: String, searchResults: List<FuzzySearch.SearchResult>) {
     val scrollState = rememberScrollState()
 
+    // 限制显示内容大小，防止大文件 OOM
+    val displayContent = if (content.length > 200_000) {
+        content.take(200_000) + "\n\n... [文件过大，仅显示前 200,000 字符] ..."
+    } else {
+        content
+    }
+
     // 构建带高亮的文本
-    val annotatedText = buildAnnotatedString {
-        if (searchResults.isEmpty()) {
-            withStyle(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp)) {
-                append(content)
-            }
-        } else {
-            // 按位置排序结果
-            val sortedResults = searchResults.sortedBy { it.position }
-            var lastEnd = 0
+    val annotatedText = try {
+        buildAnnotatedString {
+            if (searchResults.isEmpty()) {
+                withStyle(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp)) {
+                    append(displayContent)
+                }
+            } else {
+                val sortedResults = searchResults.sortedBy { it.position }
+                    .filter { it.position < displayContent.length }
+                var lastEnd = 0
 
-            for (result in sortedResults) {
-                val start = result.position.coerceAtLeast(lastEnd)
-                val end = (start + result.length).coerceAtMost(content.length)
-                if (start >= end) continue
+                for (result in sortedResults) {
+                    val start = result.position.coerceAtLeast(lastEnd)
+                    val end = (start + result.length).coerceAtMost(displayContent.length)
+                    if (start >= end || start >= displayContent.length) continue
 
-                // 匹配前的普通文本
-                if (start > lastEnd) {
+                    if (start > lastEnd) {
+                        withStyle(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp)) {
+                            append(displayContent.substring(lastEnd, start))
+                        }
+                    }
+
+                    val bgColor = when {
+                        result.similarity > 0.9f -> Color(0xFFFFEB3B)
+                        result.similarity > 0.7f -> Color(0xFFFFF176)
+                        else -> Color(0xFFFFF9C4)
+                    }
+
+                    withStyle(
+                        SpanStyle(
+                            background = bgColor,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 13.sp
+                        )
+                    ) {
+                        append(displayContent.substring(start, end))
+                    }
+
+                    lastEnd = end
+                }
+
+                if (lastEnd < displayContent.length) {
                     withStyle(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp)) {
-                        append(content.substring(lastEnd, start))
+                        append(displayContent.substring(lastEnd))
                     }
                 }
-
-                // 高亮匹配文本
-                val alpha = result.similarity
-                val bgColor = if (alpha > 0.9f) {
-                    Color(0xFFFFEB3B) // 高相似度 - 黄色
-                } else if (alpha > 0.7f) {
-                    Color(0xFFFFF176) // 中相似度 - 浅黄
-                } else {
-                    Color(0xFFFFF9C4) // 低相似度 - 淡黄
-                }
-
-                withStyle(
-                    SpanStyle(
-                        background = bgColor,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 13.sp
-                    )
-                ) {
-                    append(content.substring(start, end))
-                }
-
-                lastEnd = end
             }
-
-            // 剩余文本
-            if (lastEnd < content.length) {
-                withStyle(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp)) {
-                    append(content.substring(lastEnd))
-                }
+        }
+    } catch (e: Exception) {
+        buildAnnotatedString {
+            withStyle(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp)) {
+                append(displayContent)
             }
         }
     }
@@ -735,17 +750,50 @@ fun SearchPanel(
 
 // ==================== 工具函数 ====================
 
+/** 最大读取文件大小: 2MB */
+private const val MAX_FILE_SIZE = 2 * 1024 * 1024
+
 /**
  * 读取 TXT 文件内容
+ * 支持 UTF-8 / GBK 编码自动检测，限制最大 2MB
  */
 fun readTextFile(context: Context, uri: Uri): Pair<String, String> {
-    val fileName = uri.lastPathSegment ?: "未知文件"
+    // 提取文件名
+    val fileName = try {
+        val cursor = context.contentResolver.query(uri, null, null, null, null)
+        cursor?.use {
+            if (it.moveToFirst()) {
+                val nameIndex = it.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (nameIndex >= 0) it.getString(nameIndex) else uri.lastPathSegment ?: "未知文件"
+            } else "未知文件"
+        } ?: (uri.lastPathSegment ?: "未知文件")
+    } catch (e: Exception) {
+        uri.lastPathSegment ?: "未知文件"
+    }
+
     val content = try {
         context.contentResolver.openInputStream(uri)?.use { inputStream ->
-            BufferedReader(InputStreamReader(inputStream, Charsets.UTF_8)).use { reader ->
-                reader.readText()
+            // 读取前 2MB
+            val buffer = ByteArray(MAX_FILE_SIZE)
+            val bytesRead = inputStream.read(buffer)
+            if (bytesRead <= 0) {
+                "文件为空"
+            } else {
+                val bytes = if (bytesRead < MAX_FILE_SIZE) {
+                    buffer.copyOf(bytesRead)
+                } else {
+                    buffer
+                }
+                // 尝试 UTF-8，失败则用 GBK
+                try {
+                    String(bytes, Charsets.UTF_8)
+                } catch (e: Exception) {
+                    String(bytes, charset("GBK"))
+                }
             }
         } ?: "无法读取文件"
+    } catch (e: SecurityException) {
+        "没有权限读取该文件"
     } catch (e: Exception) {
         "读取文件失败: ${e.message}"
     }
