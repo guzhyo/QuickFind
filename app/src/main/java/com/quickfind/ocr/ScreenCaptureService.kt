@@ -136,24 +136,14 @@ class ScreenCaptureService : Service() {
                 hasCaptured = true
                 val bitmap = imageToBitmap(image)
 
-                // 通过广播发送截图结果
-                val broadcastIntent = Intent("com.quickfind.ocr.SCREEN_CAPTURE_RESULT").apply {
-                    setPackage(packageName)
-                    putExtra("bitmap", bitmap)
-                }
-                sendBroadcast(broadcastIntent)
+                // 使用静态字段传递 Bitmap，避免 Intent 大小限制和广播复杂性
+                MainActivity.capturedBitmap = bitmap
 
                 // 延迟停止服务
                 handler?.postDelayed({
                     cleanup()
                 }, 500)
             } catch (e: Exception) {
-                // 发送失败广播
-                val broadcastIntent = Intent("com.quickfind.ocr.SCREEN_CAPTURE_ERROR").apply {
-                    setPackage(packageName)
-                    putExtra("error", e.message ?: "未知错误")
-                }
-                sendBroadcast(broadcastIntent)
                 cleanup()
             } finally {
                 image.close()

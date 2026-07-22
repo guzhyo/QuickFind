@@ -1,473 +1,306 @@
 package com.quickfind.ocr
 
+import android.Manifest
 import android.app.Activity
-import android.content.BroadcastReceiver
-import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.widget.Toast
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.compose.setContent
+import android.view.View
+import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.text.withStyle
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import kotlinx.coroutines.*
 
-class MainActivity : ComponentActivity() {
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var tvTitle: TextView
+    private lateinit var tvStatus: TextView
+    private lateinit var progressBar: ProgressBar
+    private lateinit var btnOpenFile: Button
+    private lateinit var btnCapture: Button
+    private lateinit var tvOcrLabel: TextView
+    private lateinit var tvOcrText: TextView
+    private lateinit var scrollOcr: ScrollView
+    private lateinit var tvSearchSummary: TextView
+    private lateinit var tvFileLabel: TextView
+    private lateinit var tvFileContent: TextView
 
     private lateinit var ocrEngine: OcrEngine
     private lateinit var captureManager: ScreenCaptureManager
 
-    // 接收前台服务的截图结果
-    private val captureReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            when (intent?.action) {
-                "com.quickfind.ocr.SCREEN_CAPTURE_RESULT" -> {
-                    val bitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        intent.getParcelableExtra("bitmap", Bitmap::class.java)
-                    } else {
-                        @Suppress("DEPRECATION")
-                        intent.getParcelableExtra("bitmap")
-                    }
-                    if (bitmap != null) {
-                        onBitmapCaptured?.invoke(bitmap)
-                    }
-                }
-                "com.quickfind.ocr.SCREEN_CAPTURE_ERROR" -> {
-                    val error = intent.getStringExtra("error") ?: "未知错误"
-                    Toast.makeText(this@MainActivity, "截图失败: $error", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
+    private var fileName = ""
+    private var fileContent = ""
+
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+
+    companion object {
+        // 静态字段传递 Bitmap，避免 Intent 大小限制
+        var capturedBitmap: Bitmap? = null
+        const val REQUEST_NOTIFICATION = 2001
     }
 
-    var onBitmapCaptured: ((Bitmap) -> Unit)? = null
+    // 文件选择器
+    private val filePickerLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        uri?.let { loadFile(it) }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
 
+        // 初始化视图
+        tvTitle = findViewById(R.id.tvTitle)
+        tvStatus = findViewById(R.id.tvStatus)
+        progressBar = findViewById(R.id.progressBar)
+        btnOpenFile = findViewById(R.id.btnOpenFile)
+        btnCapture = findViewById(R.id.btnCapture)
+        tvOcrLabel = findViewById(R.id.tvOcrLabel)
+        tvOcrText = findViewById(R.id.tvOcrText)
+        scrollOcr = findViewById(R.id.scrollOcr)
+        tvSearchSummary = findViewById(R.id.tvSearchSummary)
+        tvFileLabel = findViewById(R.id.tvFileLabel)
+        tvFileContent = findViewById(R.id.tvFileContent)
+
+        // 初始化引擎
         try {
             ocrEngine = OcrEngine()
             captureManager = ScreenCaptureManager(this)
         } catch (e: Exception) {
-            Toast.makeText(this, "初始化失败: ${e.message}", Toast.LENGTH_LONG).show()
-            finish()
-            return
+            showStatus("初始化失败: ${e.message}")
         }
 
-        // 注册广播接收器
-        val filter = IntentFilter().apply {
-            addAction("com.quickfind.ocr.SCREEN_CAPTURE_RESULT")
-            addAction("com.quickfind.ocr.SCREEN_CAPTURE_ERROR")
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(captureReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(captureReceiver, filter)
-        }
-
-        setContent {
-            MaterialTheme {
-                QuickFindApp()
+        // 按钮事件
+        btnOpenFile.setOnClickListener {
+            try {
+                filePickerLauncher.launch(arrayOf("text/plain", "text/*", "*/*"))
+            } catch (e: Exception) {
+                showStatus("无法打开文件选择器: ${e.message}")
             }
+        }
+
+        btnCapture.setOnClickListener {
+            requestNotificationPermissionAndCapture()
+        }
+    }
+
+    // 请求通知权限后再截图（Android 13+ 需要）
+    private fun requestNotificationPermissionAndCapture() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(
+                    this,
+                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                    REQUEST_NOTIFICATION
+                )
+                return
+            }
+        }
+        startScreenCapture()
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_NOTIFICATION) {
+            // 无论是否授权都尝试截图
+            startScreenCapture()
+        }
+    }
+
+    private fun startScreenCapture() {
+        try {
+            captureManager.requestScreenCapture(this)
+        } catch (e: Exception) {
+            showStatus("截图请求失败: ${e.message}")
         }
     }
 
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == ScreenCaptureManager.REQUEST_CODE_SCREEN_CAPTURE) {
             if (resultCode == Activity.RESULT_OK && data != null) {
                 try {
                     captureManager.startCapture(resultCode, data)
+                    showStatus("正在截图...")
                 } catch (e: Exception) {
-                    Toast.makeText(this, "截图失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                    showStatus("截图失败: ${e.message}")
                 }
             } else {
-                Toast.makeText(this, "截图权限被拒绝", Toast.LENGTH_SHORT).show()
+                showStatus("截图权限被拒绝")
             }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 检查是否有截图结果
+        val bitmap = capturedBitmap
+        if (bitmap != null) {
+            capturedBitmap = null
+            processScreenshot(bitmap)
+        }
+    }
+
+    // 加载文件
+    private fun loadFile(uri: Uri) {
+        scope.launch {
+            try {
+                showLoading("正在读取文件...")
+                val (name, content) = withContext(Dispatchers.IO) {
+                    readTextFile(uri)
+                }
+                fileName = name
+                fileContent = content
+                tvTitle.text = name
+                tvFileLabel.visibility = View.VISIBLE
+                tvFileContent.text = if (content.length > 100_000) {
+                    content.substring(0, 100_000) + "\n\n... [文件过大，仅显示前10万字符]"
+                } else {
+                    content
+                }
+                tvSearchSummary.visibility = View.GONE
+                showLoading(null)
+                showStatus("已加载: $name (${content.length} 字符)")
+            } catch (e: Exception) {
+                showLoading(null)
+                showStatus("打开文件失败: ${e.message}")
+            }
+        }
+    }
+
+    // 处理截图结果
+    private fun processScreenshot(bitmap: Bitmap) {
+        scope.launch {
+            try {
+                showLoading("正在 OCR 识别...")
+                val (text, _) = withContext(Dispatchers.Default) {
+                    ocrEngine.recognizeTextWithConfidence(bitmap)
+                }
+
+                tvOcrLabel.visibility = View.VISIBLE
+                scrollOcr.visibility = View.VISIBLE
+                tvOcrText.text = text
+
+                // 自动搜索
+                if (fileContent.isNotEmpty() && text.isNotBlank()) {
+                    val query = text.lines().firstOrNull { it.isNotBlank() }?.trim() ?: text
+                    showLoading("正在搜索...")
+                    val results = withContext(Dispatchers.Default) {
+                        FuzzySearch.search(query, fileContent, 0.6f)
+                    }
+                    if (results.isNotEmpty()) {
+                        tvSearchSummary.visibility = View.VISIBLE
+                        tvSearchSummary.text = "找到 ${results.size} 个匹配结果 (关键词: ${query.take(30)})"
+                        // 显示带高亮的文件内容
+                        highlightSearchResults(results)
+                    } else {
+                        tvSearchSummary.visibility = View.VISIBLE
+                        tvSearchSummary.text = "未找到匹配结果"
+                    }
+                }
+                showLoading(null)
+                showStatus("识别完成")
+            } catch (e: Exception) {
+                showLoading(null)
+                showStatus("识别失败: ${e.message}")
+            }
+        }
+    }
+
+    // 高亮搜索结果
+    private fun highlightSearchResults(results: List<FuzzySearch.SearchResult>) {
+        val displayText = if (fileContent.length > 100_000) {
+            fileContent.substring(0, 100_000)
+        } else {
+            fileContent
+        }
+
+        val spannable = android.text.SpannableString(displayText)
+        val sorted = results.sortedBy { it.position }
+            .filter { it.position < displayText.length && it.length > 0 }
+
+        for (result in sorted) {
+            val start = result.position.coerceIn(0, displayText.length)
+            val end = (start + result.length).coerceAtMost(displayText.length)
+            if (start >= end) continue
+
+            val color = when {
+                result.similarity > 0.9f -> 0xFFFFFF00.toInt() // 黄色
+                result.similarity > 0.7f -> 0xFFFFFF99.toInt() // 浅黄
+                else -> 0xFFFFFFCC.toInt() // 淡黄
+            }
+            spannable.setSpan(
+                android.text.style.BackgroundColorSpan(color),
+                start, end,
+                android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
+            )
+        }
+        tvFileContent.text = spannable
+    }
+
+    // 读取文件
+    private fun readTextFile(uri: Uri): Pair<String, String> {
+        val displayName = try {
+            contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) cursor.getString(idx) else null
+                } else null
+            }
+        } catch (_: Exception) { null }
+        val name = displayName ?: uri.lastPathSegment ?: "未知文件"
+
+        val content = try {
+            contentResolver.openInputStream(uri)?.use { input ->
+                val buffer = ByteArray(2 * 1024 * 1024)
+                val totalRead = input.read(buffer)
+                if (totalRead <= 0) "文件为空"
+                else {
+                    val bytes = buffer.copyOf(totalRead)
+                    try {
+                        String(bytes, Charsets.UTF_8)
+                    } catch (_: Exception) {
+                        String(bytes, charset("GBK"))
+                    }
+                }
+            } ?: "无法打开文件"
+        } catch (e: SecurityException) {
+            "没有读取权限"
+        } catch (e: Exception) {
+            "读取失败: ${e.message}"
+        }
+        return Pair(name, content)
+    }
+
+    private fun showStatus(msg: String) {
+        tvStatus.text = msg
+        tvStatus.visibility = View.VISIBLE
+    }
+
+    private fun showLoading(msg: String?) {
+        if (msg != null) {
+            progressBar.visibility = View.VISIBLE
+            tvStatus.text = msg
+            tvStatus.visibility = View.VISIBLE
+        } else {
+            progressBar.visibility = View.GONE
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        try {
-            unregisterReceiver(captureReceiver)
-        } catch (_: Exception) {}
-        try {
-            ocrEngine.close()
-        } catch (_: Exception) {}
-    }
-
-    // ==================== 主界面 ====================
-
-    @OptIn(ExperimentalMaterial3Api::class)
-    @Composable
-    fun QuickFindApp() {
-        val context = LocalContext.current
-        val scope = rememberCoroutineScope()
-
-        var fileName by remember { mutableStateOf("") }
-        var fileContent by remember { mutableStateOf("") }
-        var ocrText by remember { mutableStateOf("") }
-        var searchQuery by remember { mutableStateOf("") }
-        var searchResults by remember { mutableStateOf<List<FuzzySearch.SearchResult>>(emptyList()) }
-        var isLoading by remember { mutableStateOf(false) }
-        var statusMessage by remember { mutableStateOf("") }
-
-        // 文件选择器 - 使用 */* 兼容所有文件管理器
-        val filePickerLauncher = rememberLauncherForActivityResult(
-            contract = ActivityResultContracts.OpenDocument()
-        ) { uri: Uri? ->
-            if (uri != null) {
-                scope.launch {
-                    try {
-                        isLoading = true
-                        statusMessage = "正在读取文件..."
-
-                        val (name, content) = withContext(Dispatchers.IO) {
-                            readTextFile(context, uri)
-                        }
-
-                        fileName = name
-                        fileContent = content
-                        searchResults = emptyList()
-                        ocrText = ""
-                        statusMessage = "已加载: $name (${content.length} 字符)"
-                        isLoading = false
-                    } catch (e: Exception) {
-                        isLoading = false
-                        statusMessage = "打开失败: ${e.message}"
-                    }
-                }
-            }
-        }
-
-        // 截图回调 - 直接设置在 Activity 上
-        remember {
-            this@MainActivity.onBitmapCaptured = { bitmap ->
-                scope.launch {
-                    try {
-                        isLoading = true
-                        statusMessage = "正在 OCR 识别..."
-
-                        val (text, _) = withContext(Dispatchers.Default) {
-                            ocrEngine.recognizeTextWithConfidence(bitmap)
-                        }
-                        ocrText = text
-                        searchQuery = text.lines().firstOrNull { it.isNotBlank() }?.trim() ?: ""
-
-                        // 自动搜索
-                        if (fileContent.isNotEmpty() && searchQuery.isNotEmpty()) {
-                            statusMessage = "正在搜索..."
-                            searchResults = withContext(Dispatchers.Default) {
-                                FuzzySearch.search(searchQuery, fileContent, 0.6f)
-                            }
-                            statusMessage = "识别完成，找到 ${searchResults.size} 个匹配"
-                        } else {
-                            statusMessage = "识别完成"
-                        }
-                        isLoading = false
-                    } catch (e: Exception) {
-                        isLoading = false
-                        statusMessage = "识别失败: ${e.message}"
-                    }
-                }
-            }
-        }
-
-        Scaffold(
-            topBar = {
-                TopAppBar(
-                    title = {
-                        Text(
-                            if (fileName.isNotEmpty()) fileName else "快速查找",
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                )
-            }
-        ) { padding ->
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(padding)
-                    .padding(16.dp)
-                    .verticalScroll(rememberScrollState())
-            ) {
-                // 状态消息
-                if (statusMessage.isNotEmpty()) {
-                    Surface(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(bottom = 12.dp),
-                        shape = RoundedCornerShape(8.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant
-                    ) {
-                        Text(
-                            statusMessage,
-                            modifier = Modifier.padding(12.dp),
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                    }
-                }
-
-                // 加载指示
-                if (isLoading) {
-                    LinearProgressIndicator(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(bottom = 12.dp)
-                    )
-                }
-
-                // 操作按钮
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Button(
-                        onClick = {
-                            try {
-                                filePickerLauncher.launch(arrayOf("*/*"))
-                            } catch (e: Exception) {
-                                statusMessage = "无法打开文件选择器: ${e.message}"
-                            }
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text(if (fileName.isEmpty()) "打开TXT" else "更换文件")
-                    }
-
-                    Button(
-                        onClick = {
-                            try {
-                                captureManager.requestScreenCapture(this@MainActivity)
-                            } catch (e: Exception) {
-                                statusMessage = "截图请求失败: ${e.message}"
-                            }
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("截图识别")
-                    }
-                }
-
-                // OCR 文本和搜索
-                if (ocrText.isNotEmpty()) {
-                    Text("OCR 识别结果:", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                    Spacer(Modifier.height(4.dp))
-                    Surface(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(8.dp),
-                        color = MaterialTheme.colorScheme.secondaryContainer
-                    ) {
-                        Text(
-                            ocrText,
-                            modifier = Modifier.padding(12.dp),
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 13.sp
-                        )
-                    }
-                    Spacer(Modifier.height(16.dp))
-                }
-
-                // 搜索结果摘要
-                if (searchResults.isNotEmpty()) {
-                    Text(
-                        "找到 ${searchResults.size} 个匹配结果",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 16.sp,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    Spacer(Modifier.height(8.dp))
-                }
-
-                // 文件内容
-                if (fileContent.isNotEmpty()) {
-                    Text("文件内容:", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                    Spacer(Modifier.height(4.dp))
-
-                    // 限制显示大小
-                    val displayText = if (fileContent.length > 100_000) {
-                        fileContent.substring(0, 100_000) + "\n\n... [文件过大，仅显示前10万字符]"
-                    } else {
-                        fileContent
-                    }
-
-                    // 构建带高亮文本
-                    val annotatedText = if (searchResults.isEmpty()) {
-                        buildAnnotatedString {
-                            withStyle(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp)) {
-                                append(displayText)
-                            }
-                        }
-                    } else {
-                        buildHighlightedText(displayText, searchResults)
-                    }
-
-                    Surface(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(8.dp),
-                        color = MaterialTheme.colorScheme.surface
-                    ) {
-                        Text(
-                            annotatedText,
-                            modifier = Modifier.padding(12.dp),
-                            lineHeight = 20.sp
-                        )
-                    }
-                }
-
-                // 空状态
-                if (fileContent.isEmpty() && ocrText.isEmpty()) {
-                    Spacer(Modifier.height(40.dp))
-                    Text(
-                        "使用说明:\n\n" +
-                        "1. 点击「打开TXT」选择文本文件\n" +
-                        "2. 点击「截图识别」截取屏幕文字\n" +
-                        "3. 自动在文件中模糊搜索匹配内容\n\n" +
-                        "提示: 降低搜索阈值可找到更多匹配结果",
-                        color = Color.Gray,
-                        lineHeight = 24.sp
-                    )
-                }
-
-                // 底部留白
-                Spacer(Modifier.height(32.dp))
-            }
-        }
-    }
-
-    // ==================== 高亮文本构建 ====================
-
-    private fun buildHighlightedText(
-        content: String,
-        results: List<FuzzySearch.SearchResult>
-    ): androidx.compose.ui.text.AnnotatedString {
-        return try {
-            buildAnnotatedString {
-                val sorted = results.sortedBy { it.position }
-                    .filter { it.position < content.length && it.length > 0 }
-
-                var lastEnd = 0
-                for (result in sorted) {
-                    val start = result.position.coerceIn(lastEnd, content.length)
-                    val end = (start + result.length).coerceAtMost(content.length)
-                    if (start >= end) continue
-
-                    // 普通文本
-                    if (start > lastEnd) {
-                        withStyle(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp)) {
-                            append(content.substring(lastEnd, start))
-                        }
-                    }
-
-                    // 高亮
-                    val bgColor = when {
-                        result.similarity > 0.9f -> Color(0xFFFFEB3B)
-                        result.similarity > 0.7f -> Color(0xFFFFF176)
-                        else -> Color(0xFFFFF9C4)
-                    }
-                    withStyle(SpanStyle(
-                        background = bgColor,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 13.sp
-                    )) {
-                        append(content.substring(start, end))
-                    }
-                    lastEnd = end
-                }
-
-                if (lastEnd < content.length) {
-                    withStyle(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp)) {
-                        append(content.substring(lastEnd))
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            buildAnnotatedString {
-                withStyle(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp)) {
-                    append(content)
-                }
-            }
-        }
-    }
-
-    // ==================== 文件读取 ====================
-
-    companion object {
-        private const val MAX_FILE_SIZE = 2 * 1024 * 1024 // 2MB
-
-        fun readTextFile(context: Context, uri: Uri): Pair<String, String> {
-            // 获取文件名
-            val displayName = try {
-                context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                    if (cursor.moveToFirst()) {
-                        val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-                        if (idx >= 0) cursor.getString(idx) else null
-                    } else null
-                }
-            } catch (_: Exception) { null }
-            val fileName = displayName ?: uri.lastPathSegment ?: "未知文件"
-
-            // 读取内容
-            val content = try {
-                context.contentResolver.openInputStream(uri)?.use { input ->
-                    val buffer = ByteArray(MAX_FILE_SIZE)
-                    val totalRead = input.read(buffer)
-                    if (totalRead <= 0) {
-                        "文件为空"
-                    } else {
-                        val bytes = buffer.copyOf(totalRead)
-                        // 尝试 UTF-8
-                        val text = String(bytes, Charsets.UTF_8)
-                        // 检查是否有乱码标记，尝试 GBK
-                        if (text.contains('\uFFFD') && totalRead < 100_000) {
-                            try {
-                                String(bytes, charset("GBK"))
-                            } catch (_: Exception) {
-                                text
-                            }
-                        } else {
-                            text
-                        }
-                    }
-                } ?: "无法打开文件"
-            } catch (e: SecurityException) {
-                "没有读取权限"
-            } catch (e: Exception) {
-                "读取失败: ${e.message}"
-            }
-
-            return Pair(fileName, content)
-        }
+        scope.cancel()
+        try { ocrEngine.close() } catch (_: Exception) {}
     }
 }
